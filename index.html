@@ -1197,6 +1197,7 @@
         localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
         updateProfileUI();
       }
+      // Pertahankan data pegawai, aset, users, dan logs di memori jika server mengirim lightMode: true
       appState = {
         gedung: data.gedung || [],
         lantai: data.lantai || [],
@@ -1204,12 +1205,12 @@
         ruangan: data.ruangan || [],
         barang: data.barang || [],
         usulan: data.usulan || [],
-        pegawai: data.pegawai || [],
-        aset: data.aset || [],
-        users: data.users || [],
-        logs: data.logs || []
+        pegawai: data.pegawai !== undefined ? data.pegawai : (appState.pegawai || []),
+        aset: data.aset !== undefined ? data.aset : (appState.aset || []),
+        users: data.users !== undefined ? data.users : (appState.users || []),
+        logs: data.logs !== undefined ? data.logs : (appState.logs || [])
       };
-      try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(data)); } catch (e) {}
+      try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(appState)); } catch (e) {}
 
       document.getElementById('statTotalGedung').textContent = appState.gedung.length;
       document.getElementById('statTotalLantai').textContent = appState.lantai.length;
@@ -1237,7 +1238,6 @@
       renderUsersTable();
       if (currentUser && currentUser.role === 'Admin') renderLogsTable();
     }
-
     /**
      * Mendapatkan waktu aktivitas terakhir DBR Ruangan (pembuatan/edit DBR, pindah barang disetujui, hapus barang disetujui, atau ganti PJ)
      */
@@ -1646,53 +1646,30 @@
       }).then(function(res) {
         if (!res.isConfirmed || !res.value) return;
 
-        // Rekonstruksi items ruangan agar langsung tersimpan ke saveDBRData tanpa kehilangan barang
-        const roomItems = appState.barang.filter(function(b) { return b.ID_Ruangan === idRuangan; });
-        const formattedItems = roomItems.map(function(it) {
-          const nups = String(it.NUP_List || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-          const konds = String(it.Kondisi || 'Baik').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-          const nupPairs = nups.map(function(n, idx) {
-            return { nup: n, kondisi: konds[idx] || konds[0] || 'Baik' };
-          });
-          return {
-            namaBarang: it.Nama_Barang,
-            merkType: it.Merk_Type || '',
-            kodeBarang: it.Kode_Barang || '',
-            tahunPerolehan: it.Tahun_Perolehan || '',
-            jumlah: parseInt(it.Jumlah, 10) || 1,
-            noUrut: it.No_Urut || '',
-            penguasaan: it.Penguasaan || '',
-            statusMutasi: it.Status_Mutasi || '',
-            defaultKondisi: konds[0] || 'Baik',
-            nupPairs: nupPairs
-          };
-        });
-
-        // Optimistic Instant Update (0ms langsung berubah di layar & naik ke urutan teratas)
+        // Instant Optimistic Update (0 detik langsung tampil di layar & naik ke paling atas)
         const nowStr = getLocalFormattedNow();
         room.PJ_Nama = res.value.pjNama;
         room.PJ_NIP = res.value.pjNip;
         room.Pembuat_Nama = currentUser.nama;
         room.Pembuat_NIP = currentUser.nip;
         room.Updated_At = nowStr;
+        room.Aktivitas_DBR = 'Perubahan Penanggungjawab';
         applyServerData(appState);
 
-        showLoading('Menyimpan PJ di latar belakang...');
+        // Panggil fungsi super cepat updatePjRuangan di Code.gs
         google.script.run
           .withSuccessHandler(function(srvRes) {
-            hideLoading();
             if (srvRes && srvRes.appData) applyServerData(srvRes.appData);
             triggerBackgroundPdfSync([idRuangan]);
           })
           .withFailureHandler(function(err) {
-            hideLoading();
+            refreshAllData();
             Swal.fire('Gagal', err.message, 'error');
           })
-          .saveDBRData({
+          .updatePjRuangan({
             idRuangan: idRuangan,
             pjNama: res.value.pjNama,
-            pjNip: res.value.pjNip,
-            items: formattedItems
+            pjNip: res.value.pjNip
           }, currentUser.username);
       });
     }
