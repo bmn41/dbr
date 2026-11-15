@@ -831,9 +831,55 @@
     const GAS_API_URL = 'https://script.google.com/macros/s/AKfycby1rYAYdGArzQmWh__Fu57dKIeBeypgqlcrMQhovUToWg44jAZKvMCYuCWOMMypXbmv/exec';
 
     /**
-     * Jembatan Otomatis Hybrid untuk Netlify / GitHub Pages / Vercel / APK Android
-     * Mendukung penuh format { ok: true, data } dan { status: 'OK', response }
+     * Pelindung localStorage khusus untuk Android WebViewer (MIT App Inventor).
+     * Mencegah error "Cannot read properties of null" saat login di APK Android.
      */
+    const __memoryStorage = {};
+    const safeStorage = {
+      getItem: function(key) {
+        try {
+          if (window.localStorage) {
+            const val = window.localStorage.getItem(key);
+            if (val !== null) return val;
+          }
+        } catch (e) {}
+        return __memoryStorage[key] !== undefined ? __memoryStorage[key] : null;
+      },
+      setItem: function(key, val) {
+        const strVal = String(val);
+        __memoryStorage[key] = strVal;
+        try {
+          if (window.localStorage) window.localStorage.setItem(key, strVal);
+        } catch (e) {}
+      },
+      removeItem: function(key) {
+        delete __memoryStorage[key];
+        try {
+          if (window.localStorage) window.localStorage.removeItem(key);
+        } catch (e) {}
+      },
+      clear: function() {
+        Object.keys(__memoryStorage).forEach(function(k) { delete __memoryStorage[k]; });
+        try {
+          if (window.localStorage) window.localStorage.clear();
+        } catch (e) {}
+      }
+    };
+
+    try {
+      const testKey = '__test_wv__';
+      window.localStorage.setItem(testKey, '1');
+      window.localStorage.removeItem(testKey);
+    } catch (err) {
+      try {
+        Object.defineProperty(window, 'localStorage', {
+          value: safeStorage,
+          configurable: true,
+          writable: true
+        });
+      } catch (e2) {}
+    }
+
     // Peta penyimpan ID Sementara (Client) -> ID Asli (Server Spreadsheet)
     const tempIdMap = {};
     window.__activeWriteCount = 0;
@@ -877,7 +923,6 @@
         activeEditingRoomId = realId;
       }
 
-      // Perbarui input modal yang sedang terbuka jika masih memegang ID sementara
       [
         'formIdGedung', 'formLantaiIdGedung', 'formIdLantai',
         'formKelompokIdLantai', 'formIdKelompok', 'formRuanganIdKelompok', 'formIdRuangan'
@@ -886,7 +931,6 @@
         if (el && el.value === tempId) el.value = realId;
       });
 
-      // Perbarui seluruh referensi di memori lokal
       appState.gedung.forEach(function(g) { if (g.ID_Gedung === tempId) g.ID_Gedung = realId; });
       appState.lantai.forEach(function(l) {
         if (l.ID_Lantai === tempId) l.ID_Lantai = realId;
@@ -909,8 +953,7 @@
     }
 
     /**
-     * Jembatan Otomatis Hybrid dengan Sistem Antrean Berurutan (Sequential Queue) & Auto-Retry
-     * Mencegah tabrakan simpan data di Google Spreadsheet
+     * Jembatan Otomatis Hybrid (Mendukung WebViewer Android APK via POST + Fallback GET)
      */
     (function initGasBridge() {
       if (typeof window.google !== 'undefined' && window.google.script && window.google.script.run) {
@@ -927,24 +970,58 @@
 
       function executeFetchWithRetry(action, rawArgs, attempt) {
         const cleanArgs = replaceTempIdsDeep(rawArgs);
-        return fetch(GAS_API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({ action: action, args: cleanArgs }),
-          redirect: 'follow'
-        })
+        const argsJson = JSON.stringify(cleanArgs);
+
+        // Jika di percobaan ke-2 (atau pada WebView Android yang menolak redirect POST), gunakan jalur GET
+        const useGetFallback = (attempt >= 2 && argsJson.length < 1500);
+        const fetchPromise = useGetFallback
+          ? fetch(GAS_API_URL + '?action=' + encodeURIComponent(action) + '&args=' + encodeURIComponent(argsJson) + '&_t=' + Date.now(), {
+              method: 'GET',
+              redirect: 'follow'
+            })
+          : fetch(GAS_API_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: JSON.stringify({ action: action, args: cleanArgs }),
+              redirect: 'follow'
+            });
+
+        return fetchPromise
           .then(function(res) {
             if (!res.ok) throw new Error('HTTP ' + res.status);
-            return res.json();
+            return res.text();
+          })
+          .then(function(text) {
+            try {
+              return JSON.parse(text);
+            } catch (parseErr) {
+              throw new Error('Respons server bukan JSON (Pastikan akses deployment Google Apps Script diatur ke "Siapa saja / Anyone").');
+            }
           })
           .catch(function(err) {
             if (attempt < 2) {
-              return new Promise(function(r) { setTimeout(r, 600); }).then(function() {
+              return new Promise(function(r) { setTimeout(r, 400); }).then(function() {
                 return executeFetchWithRetry(action, rawArgs, attempt + 1);
               });
             }
             throw err;
           });
+      }
+
+      function dispatchResponse(data, successHandler, failureHandler) {
+        if (data && (data.ok === true || data.status === 'OK')) {
+          const payloadResult = data.data !== undefined ? data.data : data.response;
+          if (successHandler) {
+            try {
+              successHandler(payloadResult);
+            } catch (uiErr) {
+              console.error('UI Handler Error:', uiErr);
+            }
+          }
+        } else {
+          const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
+          if (failureHandler) failureHandler(new Error(msg));
+        }
       }
 
       function createRunner(successHandler, failureHandler) {
@@ -966,13 +1043,7 @@
                   return executeFetchWithRetry(prop, args, 1)
                     .then(function(data) {
                       window.__activeWriteCount = Math.max(0, window.__activeWriteCount - 1);
-                      if (data && (data.ok === true || data.status === 'OK')) {
-                        const payloadResult = data.data !== undefined ? data.data : data.response;
-                        if (successHandler) successHandler(payloadResult);
-                      } else {
-                        const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
-                        if (failureHandler) failureHandler(new Error(msg));
-                      }
+                      dispatchResponse(data, successHandler, failureHandler);
                     })
                     .catch(function(err) {
                       window.__activeWriteCount = Math.max(0, window.__activeWriteCount - 1);
@@ -982,13 +1053,7 @@
               } else {
                 executeFetchWithRetry(prop, args, 1)
                   .then(function(data) {
-                    if (data && (data.ok === true || data.status === 'OK')) {
-                      const payloadResult = data.data !== undefined ? data.data : data.response;
-                      if (successHandler) successHandler(payloadResult);
-                    } else {
-                      const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
-                      if (failureHandler) failureHandler(new Error(msg));
-                    }
+                    dispatchResponse(data, successHandler, failureHandler);
                   })
                   .catch(function(err) {
                     if (failureHandler) failureHandler(err);
@@ -1035,7 +1100,7 @@
       startLiveClock();
       ['click', 'keydown', 'mousemove', 'scroll', 'touchstart'].forEach(function(evt) {
         window.addEventListener(evt, function() {
-          if (currentUser) localStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
+          if (currentUser) safeStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
         }, { passive: true });
       });
       restoreSessionInstant();
@@ -1166,7 +1231,7 @@
       if (idleIntervalId) clearInterval(idleIntervalId);
       idleIntervalId = setInterval(function() {
         if (!currentUser) return;
-        const lastActive = parseInt(localStorage.getItem(LAST_ACTIVE_KEY) || '0', 10);
+        const lastActive = parseInt(safeStorage.getItem(LAST_ACTIVE_KEY) || String(Date.now()), 10);
         const elapsed = Date.now() - lastActive;
         const remaining = Math.max(0, IDLE_LIMIT_MS - elapsed);
         const mins = Math.floor(remaining / 60000);
@@ -1178,17 +1243,17 @@
 
     function restoreSessionInstant() {
       try {
-        const rawUser = localStorage.getItem(SESSION_STORAGE_KEY);
-        const lastActive = parseInt(localStorage.getItem(LAST_ACTIVE_KEY) || '0', 10);
+        const rawUser = safeStorage.getItem(SESSION_STORAGE_KEY);
+        const lastActive = parseInt(safeStorage.getItem(LAST_ACTIVE_KEY) || '0', 10);
         if (!rawUser || !lastActive) return;
         if (Date.now() - lastActive > IDLE_LIMIT_MS) {
-          localStorage.clear();
+          safeStorage.clear();
           return;
         }
         currentUser = JSON.parse(rawUser);
-        localStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
+        safeStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
         enterDashboardView();
-        const cached = localStorage.getItem(DATA_CACHE_KEY);
+        const cached = safeStorage.getItem(DATA_CACHE_KEY);
         if (cached) applyServerData(JSON.parse(cached));
         refreshAllData();
       } catch (e) {}
@@ -1207,9 +1272,13 @@
       google.script.run
         .withSuccessHandler(function(appData) {
           hideLoading();
+          if (!appData || !appData.user) {
+            Swal.fire({ icon: 'error', title: 'Gagal Masuk', text: 'Data akun tidak ditemukan dari server.', background: '#0f172a', color: '#f8fafc' });
+            return;
+          }
           currentUser = appData.user;
-          localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
-          localStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
+          safeStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
+          safeStorage.setItem(LAST_ACTIVE_KEY, String(Date.now()));
           enterDashboardView();
           applyServerData(appData);
         })
@@ -1323,7 +1392,7 @@
       if (!data) return;
       if (data.user) {
         currentUser = data.user;
-        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
+        safeStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(currentUser));
         updateProfileUI();
       }
       // Pertahankan data pegawai, aset, users, dan logs di memori jika server mengirim lightMode: true
