@@ -834,10 +834,119 @@
      * Jembatan Otomatis Hybrid untuk Netlify / GitHub Pages / Vercel / APK Android
      * Mendukung penuh format { ok: true, data } dan { status: 'OK', response }
      */
+    // Peta penyimpan ID Sementara (Client) -> ID Asli (Server Spreadsheet)
+    const tempIdMap = {};
+    window.__activeWriteCount = 0;
+
+    function resolveRealId(id) {
+      let cur = String(id !== undefined && id !== null ? id : '').trim();
+      let guard = 0;
+      while (cur && tempIdMap[cur] && guard < 10) {
+        cur = tempIdMap[cur];
+        guard++;
+      }
+      return cur;
+    }
+
+    function replaceTempIdsDeep(input) {
+      if (typeof input === 'string') return resolveRealId(input);
+      if (Array.isArray(input)) return input.map(replaceTempIdsDeep);
+      if (input && typeof input === 'object') {
+        const out = {};
+        Object.keys(input).forEach(function(k) {
+          out[k] = replaceTempIdsDeep(input[k]);
+        });
+        return out;
+      }
+      return input;
+    }
+
+    function bindTempIdToServerData(tempId, realId, levelKey) {
+      if (!tempId || !realId || tempId === realId) return;
+      tempIdMap[tempId] = realId;
+
+      if (levelKey && expandedState[levelKey] && expandedState[levelKey][tempId]) {
+        expandedState[levelKey][realId] = true;
+        delete expandedState[levelKey][tempId];
+      }
+      if (levelKey === 'ruangan' && expandedPrintDbrRoom[tempId]) {
+        expandedPrintDbrRoom[realId] = true;
+        delete expandedPrintDbrRoom[tempId];
+      }
+      if (activeEditingRoomId === tempId) {
+        activeEditingRoomId = realId;
+      }
+
+      // Perbarui input modal yang sedang terbuka jika masih memegang ID sementara
+      [
+        'formIdGedung', 'formLantaiIdGedung', 'formIdLantai',
+        'formKelompokIdLantai', 'formIdKelompok', 'formRuanganIdKelompok', 'formIdRuangan'
+      ].forEach(function(elId) {
+        const el = document.getElementById(elId);
+        if (el && el.value === tempId) el.value = realId;
+      });
+
+      // Perbarui seluruh referensi di memori lokal
+      appState.gedung.forEach(function(g) { if (g.ID_Gedung === tempId) g.ID_Gedung = realId; });
+      appState.lantai.forEach(function(l) {
+        if (l.ID_Lantai === tempId) l.ID_Lantai = realId;
+        if (l.ID_Gedung === tempId) l.ID_Gedung = realId;
+      });
+      appState.kelompok.forEach(function(k) {
+        if (k.ID_Kelompok === tempId) k.ID_Kelompok = realId;
+        if (k.ID_Lantai === tempId) k.ID_Lantai = realId;
+        if (k.ID_Gedung === tempId) k.ID_Gedung = realId;
+      });
+      appState.ruangan.forEach(function(r) {
+        if (r.ID_Ruangan === tempId) r.ID_Ruangan = realId;
+        if (r.ID_Kelompok === tempId) r.ID_Kelompok = realId;
+        if (r.ID_Lantai === tempId) r.ID_Lantai = realId;
+        if (r.ID_Gedung === tempId) r.ID_Gedung = realId;
+      });
+      appState.barang.forEach(function(b) {
+        if (b.ID_Ruangan === tempId) b.ID_Ruangan = realId;
+      });
+    }
+
+    /**
+     * Jembatan Otomatis Hybrid dengan Sistem Antrean Berurutan (Sequential Queue) & Auto-Retry
+     * Mencegah tabrakan simpan data di Google Spreadsheet
+     */
     (function initGasBridge() {
       if (typeof window.google !== 'undefined' && window.google.script && window.google.script.run) {
         return;
       }
+
+      let writeQueueChain = Promise.resolve();
+      const writeActions = new Set([
+        'saveGedung', 'saveLantai', 'saveKelompok', 'saveRuangan',
+        'updatePjRuangan', 'saveDBRData', 'requestOrExecuteDelete',
+        'requestOrExecuteMoveBarang', 'cancelVerificationProposal',
+        'processVerificationProposal', 'updateUsulanChecklistAndDoc'
+      ]);
+
+      function executeFetchWithRetry(action, rawArgs, attempt) {
+        const cleanArgs = replaceTempIdsDeep(rawArgs);
+        return fetch(GAS_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: action, args: cleanArgs }),
+          redirect: 'follow'
+        })
+          .then(function(res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+          })
+          .catch(function(err) {
+            if (attempt < 2) {
+              return new Promise(function(r) { setTimeout(r, 600); }).then(function() {
+                return executeFetchWithRetry(action, rawArgs, attempt + 1);
+              });
+            }
+            throw err;
+          });
+      }
+
       function createRunner(successHandler, failureHandler) {
         return new Proxy({}, {
           get: function(_, prop) {
@@ -849,29 +958,47 @@
             }
             return function() {
               const args = Array.prototype.slice.call(arguments);
-              fetch(GAS_API_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ action: prop, args: args }),
-                redirect: 'follow'
-              })
-                .then(function(res) { return res.json(); })
-                .then(function(data) {
-                  if (data && (data.ok === true || data.status === 'OK')) {
-                    const payloadResult = data.data !== undefined ? data.data : data.response;
-                    if (successHandler) successHandler(payloadResult);
-                  } else {
-                    const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
-                    if (failureHandler) failureHandler(new Error(msg));
-                  }
-                })
-                .catch(function(err) {
-                  if (failureHandler) failureHandler(err);
+              const isWrite = writeActions.has(prop);
+
+              if (isWrite) {
+                window.__activeWriteCount++;
+                writeQueueChain = writeQueueChain.then(function() {
+                  return executeFetchWithRetry(prop, args, 1)
+                    .then(function(data) {
+                      window.__activeWriteCount = Math.max(0, window.__activeWriteCount - 1);
+                      if (data && (data.ok === true || data.status === 'OK')) {
+                        const payloadResult = data.data !== undefined ? data.data : data.response;
+                        if (successHandler) successHandler(payloadResult);
+                      } else {
+                        const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
+                        if (failureHandler) failureHandler(new Error(msg));
+                      }
+                    })
+                    .catch(function(err) {
+                      window.__activeWriteCount = Math.max(0, window.__activeWriteCount - 1);
+                      if (failureHandler) failureHandler(err);
+                    });
                 });
+              } else {
+                executeFetchWithRetry(prop, args, 1)
+                  .then(function(data) {
+                    if (data && (data.ok === true || data.status === 'OK')) {
+                      const payloadResult = data.data !== undefined ? data.data : data.response;
+                      if (successHandler) successHandler(payloadResult);
+                    } else {
+                      const msg = (data && (data.error || data.message)) ? (data.error || data.message) : 'Terjadi kesalahan pada server.';
+                      if (failureHandler) failureHandler(new Error(msg));
+                    }
+                  })
+                  .catch(function(err) {
+                    if (failureHandler) failureHandler(err);
+                  });
+              }
             };
           }
         });
       }
+
       window.google = {
         script: {
           run: createRunner(null, null)
@@ -897,8 +1024,10 @@
     };
 
     function toggleExpand(level, id) {
+      const realId = resolveRealId(id);
       if (!expandedState[level]) expandedState[level] = {};
-      expandedState[level][id] = !expandedState[level][id];
+      expandedState[level][realId] = !expandedState[level][realId];
+      if (realId !== id) expandedState[level][id] = expandedState[level][realId];
       renderHierarchy();
     }
 
@@ -2097,6 +2226,18 @@
      * CRUD SUPER CEPAT (INSTANT OPTIMISTIC UI 0 DETIK)
      * =========================================================================
      */
+    function syncServerDataWhenQueueReady(d) {
+      if (!d) return;
+      // Hanya timpa seluruh state jika antrean simpan beruntun sudah selesai semua
+      if (window.__activeWriteCount === 0) {
+        applyServerData(d);
+      } else {
+        renderHierarchy();
+        renderPrintDbrMenu();
+        updateTodayDbrBanner();
+      }
+    }
+
     function openGedungModal() {
       document.getElementById('gedungModalTitle').textContent = 'Tambah Gedung';
       document.getElementById('formIdGedung').value = '';
@@ -2104,28 +2245,31 @@
       openModal('gedungModal');
     }
     function openEditGedungModal(id) {
-      const g = appState.gedung.find(function(x) { return x.ID_Gedung === id; });
+      const realId = resolveRealId(id);
+      const g = appState.gedung.find(function(x) { return x.ID_Gedung === realId || x.ID_Gedung === id; });
       if (!g) return;
       document.getElementById('gedungModalTitle').textContent = 'Edit Nama Gedung';
-      document.getElementById('formIdGedung').value = g.ID_Gedung;
+      document.getElementById('formIdGedung').value = realId;
       document.getElementById('formNamaGedung').value = g.Nama_Gedung;
       openModal('gedungModal');
     }
     function submitGedungForm(e) {
       e.preventDefault();
-      const idGedung = document.getElementById('formIdGedung').value;
+      const rawIdGedung = document.getElementById('formIdGedung').value;
+      const idGedung = resolveRealId(rawIdGedung);
       const namaGedung = document.getElementById('formNamaGedung').value.trim();
       if (!namaGedung) return;
       closeModal('gedungModal');
 
       const nowStr = getLocalFormattedNow();
+      let tempId = '';
       if (idGedung) {
         appState.gedung.forEach(function(g) { if (g.ID_Gedung === idGedung) g.Nama_Gedung = namaGedung; });
         appState.lantai.forEach(function(l) { if (l.ID_Gedung === idGedung) l.Nama_Gedung = namaGedung; });
         appState.kelompok.forEach(function(k) { if (k.ID_Gedung === idGedung) k.Nama_Gedung = namaGedung; });
         appState.ruangan.forEach(function(r) { if (r.ID_Gedung === idGedung) r.Nama_Gedung = namaGedung; });
       } else {
-        const tempId = 'GDG-' + Date.now();
+        tempId = 'GDG-TEMP-' + Date.now();
         expandedState.gedung[tempId] = true;
         appState.gedung.push({
           ID_Gedung: tempId,
@@ -2137,45 +2281,57 @@
       applyServerData(appState);
 
       google.script.run
-        .withSuccessHandler(function(d) { applyServerData(d); })
-        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal', err.message, 'error'); })
+        .withSuccessHandler(function(d) {
+          if (tempId && d && Array.isArray(d.gedung)) {
+            const matches = d.gedung.filter(function(g) {
+              return String(g.Nama_Gedung || '').trim().toLowerCase() === namaGedung.toLowerCase();
+            });
+            if (matches.length > 0) {
+              bindTempIdToServerData(tempId, matches[matches.length - 1].ID_Gedung, 'gedung');
+            }
+          }
+          syncServerDataWhenQueueReady(d);
+        })
+        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal Menyimpan Gedung', err.message, 'error'); })
         .saveGedung({ idGedung: idGedung, namaGedung: namaGedung }, currentUser.username);
     }
 
     function openLantaiModal(idGedung, namaGedung) {
       document.getElementById('lantaiModalTitle').textContent = 'Tambah Lantai';
       document.getElementById('formIdLantai').value = '';
-      document.getElementById('formLantaiIdGedung').value = idGedung;
+      document.getElementById('formLantaiIdGedung').value = resolveRealId(idGedung);
       document.getElementById('formLantaiNamaGedung').value = namaGedung;
       document.getElementById('formNamaLantai').value = '';
       openModal('lantaiModal');
     }
     function openEditLantaiModal(id) {
-      const l = appState.lantai.find(function(x) { return x.ID_Lantai === id; });
+      const realId = resolveRealId(id);
+      const l = appState.lantai.find(function(x) { return x.ID_Lantai === realId || x.ID_Lantai === id; });
       if (!l) return;
       document.getElementById('lantaiModalTitle').textContent = 'Edit Lantai';
-      document.getElementById('formIdLantai').value = l.ID_Lantai;
-      document.getElementById('formLantaiIdGedung').value = l.ID_Gedung;
+      document.getElementById('formIdLantai').value = realId;
+      document.getElementById('formLantaiIdGedung').value = resolveRealId(l.ID_Gedung);
       document.getElementById('formLantaiNamaGedung').value = l.Nama_Gedung;
       document.getElementById('formNamaLantai').value = l.Nama_Lantai;
       openModal('lantaiModal');
     }
     function submitLantaiForm(e) {
       e.preventDefault();
-      const idLantai = document.getElementById('formIdLantai').value;
-      const idGedung = document.getElementById('formLantaiIdGedung').value;
+      const idLantai = resolveRealId(document.getElementById('formIdLantai').value);
+      const idGedung = resolveRealId(document.getElementById('formLantaiIdGedung').value);
       const namaGedung = document.getElementById('formLantaiNamaGedung').value;
       const namaLantai = document.getElementById('formNamaLantai').value.trim();
       if (!namaLantai) return;
       closeModal('lantaiModal');
 
       const nowStr = getLocalFormattedNow();
+      let tempId = '';
       if (idLantai) {
         appState.lantai.forEach(function(l) { if (l.ID_Lantai === idLantai) l.Nama_Lantai = namaLantai; });
         appState.kelompok.forEach(function(k) { if (k.ID_Lantai === idLantai) k.Nama_Lantai = namaLantai; });
         appState.ruangan.forEach(function(r) { if (r.ID_Lantai === idLantai) r.Nama_Lantai = namaLantai; });
       } else {
-        const tempId = 'LNT-' + Date.now();
+        tempId = 'LNT-TEMP-' + Date.now();
         expandedState.gedung[idGedung] = true;
         expandedState.lantai[tempId] = true;
         appState.lantai.push({
@@ -2190,28 +2346,41 @@
       applyServerData(appState);
 
       google.script.run
-        .withSuccessHandler(function(d) { applyServerData(d); })
-        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal', err.message, 'error'); })
+        .withSuccessHandler(function(d) {
+          if (tempId && d && Array.isArray(d.lantai)) {
+            const realGdgId = resolveRealId(idGedung);
+            const matches = d.lantai.filter(function(l) {
+              return l.ID_Gedung === realGdgId && String(l.Nama_Lantai || '').trim().toLowerCase() === namaLantai.toLowerCase();
+            });
+            if (matches.length > 0) {
+              bindTempIdToServerData(tempId, matches[matches.length - 1].ID_Lantai, 'lantai');
+            }
+          }
+          syncServerDataWhenQueueReady(d);
+        })
+        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal Menyimpan Lantai', err.message, 'error'); })
         .saveLantai({ idLantai: idLantai, idGedung: idGedung, namaLantai: namaLantai }, currentUser.username);
     }
 
     function openKelompokModal(idLantai) {
-      const l = appState.lantai.find(function(x) { return x.ID_Lantai === idLantai; });
+      const realLantaiId = resolveRealId(idLantai);
+      const l = appState.lantai.find(function(x) { return x.ID_Lantai === realLantaiId || x.ID_Lantai === idLantai; });
       if (!l) return;
       document.getElementById('kelompokModalTitle').textContent = 'Tambah Kelompok Ruangan';
       document.getElementById('formIdKelompok').value = '';
-      document.getElementById('formKelompokIdLantai').value = l.ID_Lantai;
+      document.getElementById('formKelompokIdLantai').value = realLantaiId;
       document.getElementById('formKelompokInfoLantai').value = l.Nama_Gedung + ' — ' + l.Nama_Lantai;
       document.getElementById('formNamaKelompok').value = '';
       document.getElementById('formKetKelompok').value = '';
       openModal('kelompokModal');
     }
     function openEditKelompokModal(id) {
-      const k = appState.kelompok.find(function(x) { return x.ID_Kelompok === id; });
+      const realId = resolveRealId(id);
+      const k = appState.kelompok.find(function(x) { return x.ID_Kelompok === realId || x.ID_Kelompok === id; });
       if (!k) return;
       document.getElementById('kelompokModalTitle').textContent = 'Edit Kelompok Ruangan';
-      document.getElementById('formIdKelompok').value = k.ID_Kelompok;
-      document.getElementById('formKelompokIdLantai').value = k.ID_Lantai;
+      document.getElementById('formIdKelompok').value = realId;
+      document.getElementById('formKelompokIdLantai').value = resolveRealId(k.ID_Lantai);
       document.getElementById('formKelompokInfoLantai').value = k.Nama_Gedung + ' — ' + k.Nama_Lantai;
       document.getElementById('formNamaKelompok').value = k.Nama_Kelompok;
       document.getElementById('formKetKelompok').value = k.Keterangan || '';
@@ -2219,8 +2388,8 @@
     }
     function submitKelompokForm(e) {
       e.preventDefault();
-      const idKelompok = document.getElementById('formIdKelompok').value;
-      const idLantai = document.getElementById('formKelompokIdLantai').value;
+      const idKelompok = resolveRealId(document.getElementById('formIdKelompok').value);
+      const idLantai = resolveRealId(document.getElementById('formKelompokIdLantai').value);
       const namaKelompok = document.getElementById('formNamaKelompok').value.trim();
       const keterangan = document.getElementById('formKetKelompok').value.trim();
       if (!namaKelompok) return;
@@ -2228,6 +2397,7 @@
 
       const lnt = appState.lantai.find(function(x) { return x.ID_Lantai === idLantai; }) || {};
       const nowStr = getLocalFormattedNow();
+      let tempId = '';
       if (idKelompok) {
         appState.kelompok.forEach(function(k) {
           if (k.ID_Kelompok === idKelompok) {
@@ -2237,7 +2407,7 @@
         });
         appState.ruangan.forEach(function(r) { if (r.ID_Kelompok === idKelompok) r.Nama_Kelompok = namaKelompok; });
       } else {
-        const tempId = 'KLP-' + Date.now();
+        tempId = 'KLP-TEMP-' + Date.now();
         expandedState.lantai[idLantai] = true;
         expandedState.kelompok[tempId] = true;
         appState.kelompok.push({
@@ -2255,15 +2425,26 @@
       applyServerData(appState);
 
       google.script.run
-        .withSuccessHandler(function(d) { applyServerData(d); })
-        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal', err.message, 'error'); })
+        .withSuccessHandler(function(d) {
+          if (tempId && d && Array.isArray(d.kelompok)) {
+            const realLntId = resolveRealId(idLantai);
+            const matches = d.kelompok.filter(function(k) {
+              return k.ID_Lantai === realLntId && String(k.Nama_Kelompok || '').trim().toLowerCase() === namaKelompok.toLowerCase();
+            });
+            if (matches.length > 0) {
+              bindTempIdToServerData(tempId, matches[matches.length - 1].ID_Kelompok, 'kelompok');
+            }
+          }
+          syncServerDataWhenQueueReady(d);
+        })
+        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal Menyimpan Kelompok', err.message, 'error'); })
         .saveKelompok({ idKelompok: idKelompok, idLantai: idLantai, namaKelompok: namaKelompok, keterangan: keterangan }, currentUser.username);
     }
 
     function openRuanganModal(idKelompok, namaKelompok) {
       document.getElementById('ruanganModalTitle').textContent = 'Tambah Ruangan';
       document.getElementById('formIdRuangan').value = '';
-      document.getElementById('formRuanganIdKelompok').value = idKelompok;
+      document.getElementById('formRuanganIdKelompok').value = resolveRealId(idKelompok);
       document.getElementById('formRuanganNamaKelompok').value = namaKelompok;
       document.getElementById('formNamaRuangan').value = '';
       document.getElementById('formKodeRuangan').value = '';
@@ -2271,11 +2452,12 @@
       openModal('ruanganModal');
     }
     function openEditRuanganModal(id) {
-      const r = appState.ruangan.find(function(x) { return x.ID_Ruangan === id; });
+      const realId = resolveRealId(id);
+      const r = appState.ruangan.find(function(x) { return x.ID_Ruangan === realId || x.ID_Ruangan === id; });
       if (!r) return;
       document.getElementById('ruanganModalTitle').textContent = 'Edit Ruangan';
-      document.getElementById('formIdRuangan').value = r.ID_Ruangan;
-      document.getElementById('formRuanganIdKelompok').value = r.ID_Kelompok;
+      document.getElementById('formIdRuangan').value = realId;
+      document.getElementById('formRuanganIdKelompok').value = resolveRealId(r.ID_Kelompok);
       document.getElementById('formRuanganNamaKelompok').value = r.Nama_Kelompok;
       document.getElementById('formNamaRuangan').value = r.Nama_Ruangan;
       document.getElementById('formKodeRuangan').value = r.Kode_Ruangan || '';
@@ -2284,8 +2466,8 @@
     }
     function submitRuanganForm(e) {
       e.preventDefault();
-      const idRuangan = document.getElementById('formIdRuangan').value;
-      const idKelompok = document.getElementById('formRuanganIdKelompok').value;
+      const idRuangan = resolveRealId(document.getElementById('formIdRuangan').value);
+      const idKelompok = resolveRealId(document.getElementById('formRuanganIdKelompok').value);
       const namaRuangan = document.getElementById('formNamaRuangan').value.trim();
       const kodeRuangan = document.getElementById('formKodeRuangan').value.trim();
       const kodeUpb = document.getElementById('formKodeUpb').value.trim();
@@ -2294,17 +2476,17 @@
 
       const klp = appState.kelompok.find(function(x) { return x.ID_Kelompok === idKelompok; }) || {};
       const nowStr = getLocalFormattedNow();
+      let tempId = '';
       if (idRuangan) {
         appState.ruangan.forEach(function(r) {
           if (r.ID_Ruangan === idRuangan) {
             r.Nama_Ruangan = namaRuangan;
             r.Kode_Ruangan = kodeRuangan;
             r.Kode_UPB = kodeUpb;
-            r.Updated_At = nowStr;
           }
         });
       } else {
-        const tempId = 'RNG-' + Date.now();
+        tempId = 'RNG-TEMP-' + Date.now();
         expandedState.kelompok[idKelompok] = true;
         expandedState.ruangan[tempId] = true;
         appState.ruangan.push({
@@ -2321,7 +2503,7 @@
           PJ_NIP: '',
           Pembuat_Nama: currentUser.nama,
           Pembuat_NIP: currentUser.nip,
-          Updated_At: nowStr,
+          Updated_At: '',
           Pdf_File_Id: '',
           Pdf_Url: '',
           Kode_UPB: kodeUpb
@@ -2330,8 +2512,19 @@
       applyServerData(appState);
 
       google.script.run
-        .withSuccessHandler(function(d) { applyServerData(d); })
-        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal', err.message, 'error'); })
+        .withSuccessHandler(function(d) {
+          if (tempId && d && Array.isArray(d.ruangan)) {
+            const realKlpId = resolveRealId(idKelompok);
+            const matches = d.ruangan.filter(function(r) {
+              return r.ID_Kelompok === realKlpId && String(r.Nama_Ruangan || '').trim().toLowerCase() === namaRuangan.toLowerCase();
+            });
+            if (matches.length > 0) {
+              bindTempIdToServerData(tempId, matches[matches.length - 1].ID_Ruangan, 'ruangan');
+            }
+          }
+          syncServerDataWhenQueueReady(d);
+        })
+        .withFailureHandler(function(err) { refreshAllData(); Swal.fire('Gagal Menyimpan Ruangan', err.message, 'error'); })
         .saveRuangan({
           idRuangan: idRuangan,
           idKelompok: idKelompok,
@@ -2342,13 +2535,14 @@
     }
 
     function confirmDeleteEntity(targetType, targetId, targetLabel) {
+      const realTargetId = resolveRealId(targetId);
       const isPengelola = currentUser && currentUser.role === 'Pengelola';
       Swal.fire({
         title: (isPengelola ? 'Ajukan Hapus ' : 'Hapus ') + targetType,
         html: `
           <div class="text-left space-y-3 pt-2">
             <div class="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200">
-              Target Hapus: <strong class="text-white">${esc(targetLabel || targetId)}</strong>
+              Target Hapus: <strong class="text-white">${esc(targetLabel || realTargetId)}</strong>
             </div>
 
             <div>
@@ -2396,29 +2590,28 @@
 
         const nowStr = getLocalFormattedNow();
         if (!isPengelola) {
-          // Instant Optimistic Delete (0ms langsung terhapus di layar & masuk urutan teratas)
           if (targetType === 'BARANG') {
-            const targetItem = appState.barang.find(function(b) { return b.ID_Barang === targetId; });
+            const targetItem = appState.barang.find(function(b) { return b.ID_Barang === realTargetId; });
             if (targetItem) {
               const room = appState.ruangan.find(function(r) { return r.ID_Ruangan === targetItem.ID_Ruangan; });
               if (room) room.Updated_At = nowStr;
             }
-            appState.barang = appState.barang.filter(function(b) { return b.ID_Barang !== targetId; });
+            appState.barang = appState.barang.filter(function(b) { return b.ID_Barang !== realTargetId; });
           } else if (targetType === 'RUANGAN') {
-            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Ruangan !== targetId; });
-            appState.barang = appState.barang.filter(function(b) { return b.ID_Ruangan !== targetId; });
+            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Ruangan !== realTargetId; });
+            appState.barang = appState.barang.filter(function(b) { return b.ID_Ruangan !== realTargetId; });
           } else if (targetType === 'KELOMPOK') {
-            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Kelompok !== targetId; });
-            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Kelompok !== targetId; });
+            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Kelompok !== realTargetId; });
+            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Kelompok !== realTargetId; });
           } else if (targetType === 'LANTAI') {
-            appState.lantai = appState.lantai.filter(function(l) { return l.ID_Lantai !== targetId; });
-            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Lantai !== targetId; });
-            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Lantai !== targetId; });
+            appState.lantai = appState.lantai.filter(function(l) { return l.ID_Lantai !== realTargetId; });
+            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Lantai !== realTargetId; });
+            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Lantai !== realTargetId; });
           } else if (targetType === 'GEDUNG') {
-            appState.gedung = appState.gedung.filter(function(g) { return g.ID_Gedung !== targetId; });
-            appState.lantai = appState.lantai.filter(function(l) { return l.ID_Gedung !== targetId; });
-            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Gedung !== targetId; });
-            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Gedung !== targetId; });
+            appState.gedung = appState.gedung.filter(function(g) { return g.ID_Gedung !== realTargetId; });
+            appState.lantai = appState.lantai.filter(function(l) { return l.ID_Gedung !== realTargetId; });
+            appState.kelompok = appState.kelompok.filter(function(k) { return k.ID_Gedung !== realTargetId; });
+            appState.ruangan = appState.ruangan.filter(function(r) { return r.ID_Gedung !== realTargetId; });
           }
           applyServerData(appState);
         }
@@ -2427,7 +2620,7 @@
         google.script.run
           .withSuccessHandler(function(r) {
             hideLoading();
-            if (r && r.appData) applyServerData(r.appData);
+            if (r && r.appData) syncServerDataWhenQueueReady(r.appData);
             if (r && r.affectedRoomIds && r.affectedRoomIds.length > 0) {
               triggerBackgroundPdfSync(r.affectedRoomIds);
             }
@@ -2448,7 +2641,7 @@
           })
           .requestOrExecuteDelete({
             targetType: targetType,
-            targetId: targetId,
+            targetId: realTargetId,
             targetLabel: targetLabel,
             noDokumenSK: res.value.noDokumenSK,
             skAda: res.value.skAda,
@@ -2459,9 +2652,10 @@
     }
 
     function openDbrModal(idRuangan) {
-      const room = appState.ruangan.find(function(r) { return r.ID_Ruangan === idRuangan; });
+      const realRoomId = resolveRealId(idRuangan);
+      const room = appState.ruangan.find(function(r) { return r.ID_Ruangan === realRoomId || r.ID_Ruangan === idRuangan; });
       if (!room) return;
-      activeEditingRoomId = idRuangan;
+      activeEditingRoomId = room.ID_Ruangan;
       document.getElementById('dbrModalKelompokBadge').textContent = room.Nama_Kelompok;
       document.getElementById('dbrModalTitle').textContent = 'DBR — ' + room.Nama_Ruangan;
       document.getElementById('formPjNama').value = room.PJ_Nama || '';
@@ -2471,7 +2665,9 @@
 
       backToStepItems();
 
-      const existingItems = appState.barang.filter(function(b) { return b.ID_Ruangan === idRuangan; });
+      const existingItems = appState.barang.filter(function(b) {
+        return b.ID_Ruangan === realRoomId || b.ID_Ruangan === idRuangan;
+      });
       const container = document.getElementById('itemsFormList');
       container.innerHTML = '';
 
@@ -2930,8 +3126,13 @@
       const pjNip = document.getElementById('formPjNip').value.trim();
       if (!pjNama || !pjNip) return Swal.fire('Lengkapi Data', 'Nama dan NIP Penanggungjawab wajib diisi.', 'warning');
 
+      const targetRoomId = resolveRealId(activeEditingRoomId);
+      const nowStr = getLocalFormattedNow();
+      const baseTs = Date.now();
       const items = [];
-      document.querySelectorAll('#itemsFormList .dbr-item-card').forEach(function(c) {
+      const optimisticBarangRows = [];
+
+      document.querySelectorAll('#itemsFormList .dbr-item-card').forEach(function(c, idx) {
         const pairRows = c.querySelectorAll('.nup-pair-row');
         const nupPairs = [];
         pairRows.forEach(function(r) {
@@ -2940,43 +3141,89 @@
           if (n) nupPairs.push({ nup: n, kondisi: k });
         });
         const firstKondisi = pairRows.length > 0 ? pairRows[0].querySelector('.inp-nup-kondisi').value : 'Baik';
+        const namaBarang = c.querySelector('.inp-nama-barang').value.trim();
+        const merkType = c.querySelector('.inp-merk-type').value.trim();
+        const kodeBarang = c.querySelector('.inp-kode-barang').value.trim();
+        const tahunPerolehan = c.querySelector('.inp-tahun').value.trim();
+        let jumlah = parseInt(c.querySelector('.inp-jumlah').value, 10) || 1;
+        if (nupPairs.length > 1 && jumlah < nupPairs.length) jumlah = nupPairs.length;
+        const penguasaan = c.querySelector('.inp-penguasaan').value.trim();
+        const statusMutasi = c.dataset.statusMutasi || '';
 
         items.push({
-          namaBarang: c.querySelector('.inp-nama-barang').value.trim(),
-          merkType: c.querySelector('.inp-merk-type').value.trim(),
-          kodeBarang: c.querySelector('.inp-kode-barang').value.trim(),
-          tahunPerolehan: c.querySelector('.inp-tahun').value.trim(),
-          jumlah: parseInt(c.querySelector('.inp-jumlah').value, 10) || 1,
+          namaBarang: namaBarang,
+          merkType: merkType,
+          kodeBarang: kodeBarang,
+          tahunPerolehan: tahunPerolehan,
+          jumlah: jumlah,
           noUrut: '',
-          penguasaan: c.querySelector('.inp-penguasaan').value.trim(),
-          statusMutasi: c.dataset.statusMutasi || '',
+          penguasaan: penguasaan,
+          statusMutasi: statusMutasi,
           defaultKondisi: firstKondisi,
           nupPairs: nupPairs
         });
+
+        optimisticBarangRows.push({
+          ID_Barang: 'BRG-' + baseTs + '-' + (idx + 1),
+          ID_Ruangan: targetRoomId,
+          Nama_Barang: namaBarang,
+          Merk_Type: merkType,
+          Kode_Barang: kodeBarang,
+          Tahun_Perolehan: tahunPerolehan,
+          NUP_List: nupPairs.map(function(p) { return p.nup; }).join(', '),
+          Kondisi: nupPairs.length > 0 ? nupPairs.map(function(p) { return p.kondisi; }).join(', ') : firstKondisi,
+          Jumlah: String(jumlah),
+          No_Urut: '',
+          Penguasaan: penguasaan,
+          Status_Mutasi: statusMutasi,
+          Updated_By: currentUser.nama + ' (' + currentUser.nip + ')',
+          Updated_At: nowStr
+        });
       });
 
-      const targetRoomId = activeEditingRoomId;
       closeModal('dbrModal');
+
+      // Langsung tampil di layar dalam 0 detik dan masuk ke daftar Print DBR Terbaru
+      appState.barang = appState.barang
+        .filter(function(b) { return b.ID_Ruangan !== targetRoomId && b.ID_Ruangan !== activeEditingRoomId; })
+        .concat(optimisticBarangRows);
+
+      appState.ruangan.forEach(function(r) {
+        if (r.ID_Ruangan === targetRoomId || r.ID_Ruangan === activeEditingRoomId) {
+          r.PJ_Nama = pjNama;
+          r.PJ_NIP = pjNip;
+          r.Pembuat_Nama = currentUser.nama;
+          r.Pembuat_NIP = currentUser.nip;
+          r.Updated_At = nowStr;
+          r.Aktivitas_DBR = 'Update Data Barang DBR';
+        }
+      });
+      applyServerData(appState);
+
       showLoading('Menyimpan DBR...');
       google.script.run
         .withSuccessHandler(function(res) {
           hideLoading();
-          applyServerData(res.appData);
+          if (res && res.appData) syncServerDataWhenQueueReady(res.appData);
           Swal.fire({
             icon: 'success',
             title: 'DBR Tersimpan!',
-            text: 'Data berhasil disimpan & PDF Drive sedang diperbarui otomatis di latar belakang.',
-            timer: 1500,
+            text: 'Data berhasil disimpan & PDF Drive sedang diperbarui di latar belakang.',
+            timer: 1300,
             showConfirmButton: false,
             background: '#0f172a',
             color: '#f8fafc'
           });
-          triggerBackgroundPdfSync([targetRoomId]);
+          const resolvedRoomId = (res && res.idRuangan) ? res.idRuangan : resolveRealId(targetRoomId);
+          triggerBackgroundPdfSync([resolvedRoomId]);
         })
-        .withFailureHandler(function(err) { hideLoading(); Swal.fire('Gagal', err.message, 'error'); })
+        .withFailureHandler(function(err) {
+          hideLoading();
+          refreshAllData();
+          Swal.fire('Gagal Menyimpan DBR', err.message, 'error');
+        })
         .saveDBRData({ idRuangan: targetRoomId, pjNama: pjNama, pjNip: pjNip, items: items }, currentUser.username);
     }
-
     function openMoveBarangModal(idBarang) {
       const it = appState.barang.find(function(b) { return b.ID_Barang === idBarang; });
       if (!it) return;
